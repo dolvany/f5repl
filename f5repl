@@ -1,0 +1,62 @@
+#!/bin/bash
+
+# F5REPL
+# Replicate F5 pools, members and states from lb1 to lb2.
+# F5 Replication Parameters
+auth="munge"
+lb1="lb1.your.net"
+lb2="lb2.your.net"
+lb1partition="Common"
+lb2partition="Common"
+
+# MAP DATA SETS
+# Retrieve
+lb1pools=$(curl -sH "Authorization: Basic $auth" "https://$lb1/mgmt/tm/ltm/pool?\$filter=partition+eq+$lb1partition&expandSubcollections=true")
+lb1nodes=$(curl -sH "Authorization: Basic $auth" "https://$lb1/mgmt/tm/ltm/node?\$filter=partition+eq+$lb1partition")
+lb2pools=$(curl -sH "Authorization: Basic $auth" "https://$lb2/mgmt/tm/ltm/pool?\$filter=partition+eq+$lb2partition&expandSubcollections=true")
+lb2nodes=$(curl -sH "Authorization: Basic $auth" "https://$lb2/mgmt/tm/ltm/node?\$filter=partition+eq+$lb2partition")
+# Filter
+lb1pools=$(jq '.items' <(echo "$lb1pools"))
+lb1nodes=$(jq '.items' <(echo "$lb1nodes"))
+lb2pools=$(jq '.items//[]' <(echo "$lb2pools"))
+lb2nodes=$(jq '.items//[]' <(echo "$lb2nodes"))
+# Map
+items=$(jq -n --arg lb2 "$lb2" --arg lb2partition "$lb2partition" --slurpfile lb1pools <(echo $lb1pools) --slurpfile lb1nodes <(echo $lb1nodes) --slurpfile lb2pools <(echo $lb2pools) --slurpfile lb2nodes <(echo $lb2nodes) '{lb2:{baseurl:"https://\($lb2)/mgmt/tm/ltm",partition:$lb2partition}}+({lb1pools,lb1members}|map_values($lb1pools[]))+({lb1nodes}|map_values($lb1nodes[]))+({lb2pools,lb2members}|map_values($lb2pools[]))+({lb2nodes}|map_values($lb2nodes[]))')
+
+# REDUCE DATA SETS
+# Pools
+items=$(jq '.lb1pools=(.lb1pools|map(del(.membersReference,.generation)|{name,body:.}))' <(echo "$items"))
+items=$(jq '.lb2pools=(.lb2pools|map(del(.membersReference,.generation)|{name,body:.}))' <(echo "$items"))
+items=$(jq '.+{poolupdate:(.lb2pools as $lb2pools|.lb1pools-.lb2pools|map(select([$lb2pools[].name==.name]|any)))}' <(echo "$items"))
+items=$(jq '.+{poolcreate:(.lb2pools as $lb2pools|.lb1pools-.lb2pools|map(select([$lb2pools[].name==.name]|any|not)))}' <(echo "$items"))
+items=$(jq '.+{pooldelete:((.lb2pools|map(.name))-(.lb1pools|map(.name)))}' <(echo "$items"))
+# Pool Members
+items=$(jq '.lb1members=(.lb1members|map(.name as $pool|.membersReference.items[]?|del(.generation)|if .session=="user-disabled" then .|.state="user-down" else (.|.session="user-enabled"|.state="user-up") end|{pool:$pool,name,body:.}))' <(echo "$items"))
+items=$(jq '.lb2members=(.lb2members|map(.name as $pool|.membersReference.items[]?|del(.generation)|if .session=="user-disabled" then .|.state="user-down" else (.|.session="user-enabled"|.state="user-up") end|{pool:$pool,name,body:.}))' <(echo "$items"))
+items=$(jq '.+{memberupdate:(.lb2members as $lb2members|.lb1members-$lb2members|map(select([$lb2members[] as $lb2|[$lb2.pool==.pool,$lb2.name==.name]|all]|any)))}' <(echo "$items"))
+items=$(jq '.+{membercreate:(.lb2members as $lb2members|.lb1members-$lb2members|map(select([$lb2members[] as $lb2|[$lb2.pool==.pool,$lb2.name==.name]|all]|any|not)))}' <(echo "$items"))
+items=$(jq '.+{memberdelete:((.lb2members|map({pool,name:.name}))-(.lb1members|map({pool,name:.name})))}' <(echo "$items"))
+# Nodes
+items=$(jq '.lb1nodes=(.lb1nodes|map(del(.generation)|if .session=="user-disabled" then .|.state="user-down" else (.|.session="user-enabled"|.state="user-up") end|{name,body:.}))' <(echo "$items"))
+items=$(jq '.lb2nodes=(.lb2nodes|map(del(.generation)|if .session=="user-disabled" then .|.state="user-down" else (.|.session="user-enabled"|.state="user-up") end|{name,body:.}))' <(echo "$items"))
+items=$(jq '.+{nodeupdate:(.lb2nodes as $lb2nodes|.lb1nodes-.lb2nodes|map(select([$lb2nodes[].name==.name]|any)))}' <(echo "$items"))
+items=$(jq '.+{nodedelete:((.lb2nodes|map(.name))-(.lb1nodes|map(.name)))}' <(echo "$items"))
+# Add Curl Parameters
+items=$(jq '.nodeupdate=.lb2 as $lb2|(.nodeupdate|map(.+{method:"PUT",url:"\($lb2.baseurl)/node/~\($lb2.partition)~\(.name)"}))?//.' <(echo "$items"))
+items=$(jq '.poolupdate=.lb2 as $lb2|(.poolupdate|map(.+{method:"PUT",url:"\($lb2.baseurl)/pool/~\($lb2.partition)~\(.name)"}))?//.' <(echo "$items"))
+items=$(jq '.memberupdate=.lb2 as $lb2|(.memberupdate|map(.+{method:"PUT",url:"\($lb2.baseurl)/pool/~\($lb2.partition)~\(.pool)/members/~\($lb2.partition)~\(.name)"}))?//.' <(echo "$items"))
+items=$(jq '.nodecreate=.lb2 as $lb2|(.nodecreate|map(.+{method:"POST",url:"\($lb2.baseurl)/node"}))?//.' <(echo "$items"))
+items=$(jq '.poolcreate=.lb2 as $lb2|(.poolcreate|map(.+{method:"POST",url:"\($lb2.baseurl)/pool"}))?//.' <(echo "$items"))
+items=$(jq '.membercreate=.lb2 as $lb2|(.membercreate|map(.+{method:"POST",url:"\($lb2.baseurl)/pool/~\($lb2.partition)~\(.pool)/members"}))?//.' <(echo "$items"))
+items=$(jq '.nodedelete=.lb2 as $lb2|(.nodedelete|map({method:"DELETE",url:"\($lb2.baseurl)/node/~\($lb2.partition)~\(.)",body:{}}))?//.' <(echo "$items"))
+items=$(jq '.pooldelete=.lb2 as $lb2|(.pooldelete|map({method:"DELETE",url:"\($lb2.baseurl)/pool/~\($lb2.partition)~\(.)",body:{}}))?//.' <(echo "$items"))
+items=$(jq '.memberdelete=.lb2 as $lb2|(.memberdelete|map(.+{method:"DELETE",url:"\($lb2.baseurl)/pool/~\($lb2.partition)~\(.pool)/members/~\($lb2.partition)~\(.name)",body:{}}))?//.' <(echo "$items"))
+
+# DEPLOY F5 OBJECTS
+while read item; do
+  url=$(jq -r '.url' <(echo "$item"))
+  method=$(jq -r '.method' <(echo "$item"))
+  body=$(jq -c '.body' <(echo "$item"))
+  response=$(curl -sN -X "$method" -H "Content-Type: application/json" -H "Authorization: Basic $auth" -d "$body" -o /dev/null -w "%{http_code}" "$url")
+  jq -nc --arg response "$response" --argjson body "$body" --arg url "$url" --arg method "$method" '{time:(now|todate),type:"f5repl",method:$method,url:$url,response:$response|tonumber,body:$body}' >> f5repl.log
+done < <(jq -c '(.poolcreate,.poolupdate,.pooldelete,.membercreate,.memberupdate,.memberdelete,.nodeupdate,.nodedelete)[]' <(echo "$items"))
